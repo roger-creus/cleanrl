@@ -20,6 +20,7 @@ from stable_baselines3.common.atari_wrappers import (
 from stable_baselines3.common.buffers import ReplayBuffer
 from torch.utils.tensorboard import SummaryWriter
 
+from IPython import embed
 
 @dataclass
 class Args:
@@ -179,7 +180,8 @@ poetry run pip install "stable_baselines3==2.0.0a1" "gymnasium[atari,accept-rom-
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
-    device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+    #device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+    device = "cpu"
 
     # env setup
     envs = gym.vector.SyncVectorEnv(
@@ -252,6 +254,7 @@ poetry run pip install "stable_baselines3==2.0.0a1" "gymnasium[atari,accept-rom-
                     # example bj = 1, then the upper ceiling should be uj= 2, and lj= 1
                     d_m_l = (u + (l == u).float() - b) * next_pmfs
                     d_m_u = (b - l) * next_pmfs
+                    
                     target_pmfs = torch.zeros_like(next_pmfs)
                     for i in range(target_pmfs.size(0)):
                         target_pmfs[i].index_add_(0, l[i].long(), d_m_l[i])
