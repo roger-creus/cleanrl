@@ -18,7 +18,6 @@ from torch.utils.tensorboard import SummaryWriter
 
 from IPython import embed
 
-
 @dataclass
 class Args:
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
@@ -211,37 +210,86 @@ class NoisyLinear(nn.Linear):
         else:
             return None
 
+def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
+    torch.nn.init.orthogonal_(layer.weight, std)
+    torch.nn.init.constant_(layer.bias, bias_const)
+    return layer
+
+class ResidualBlock(nn.Module):
+    def __init__(self, channels, size=84):
+        super().__init__()
+        self.conv0 = layer_init(nn.Conv2d(in_channels=channels, out_channels=channels, kernel_size=3, padding=1))
+        self.layer_norm0 = nn.LayerNorm([channels, size, size])
+
+        self.conv1 = layer_init(nn.Conv2d(in_channels=channels, out_channels=channels, kernel_size=3, padding=1))
+        self.layer_norm1 = nn.LayerNorm([channels, size, size])
+
+
+    def forward(self, x):
+        inputs = x
+        x = nn.functional.relu(x)
+        x = self.conv0(x)
+        x = self.layer_norm0(x)
+        x = nn.functional.relu(x)
+        x = self.conv1(x)
+        x = self.layer_norm1(x)
+        return x + inputs
+
+class ConvSequence(nn.Module):
+    def __init__(self, input_shape, out_channels, size=84):
+        super().__init__()
+        self._input_shape = input_shape
+        self._out_channels = out_channels
+        self.conv = layer_init(nn.Conv2d(in_channels=self._input_shape[0], out_channels=self._out_channels, kernel_size=3, padding=1))
+        self.layer_norm = nn.LayerNorm([self._out_channels, self._input_shape[1], self._input_shape[2]])
+        self.res_block0 = ResidualBlock(self._out_channels, (size+1) // 2)
+        self.res_block1 = ResidualBlock(self._out_channels, (size+1) // 2)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.layer_norm(x)
+        x = nn.functional.max_pool2d(x, kernel_size=3, stride=2, padding=1)
+        x = self.res_block0(x)
+        x = self.res_block1(x)
+        assert x.shape[1:] == self.get_output_shape()
+        return x
+
+    def get_output_shape(self):
+        _c, h, w = self._input_shape
+        return (self._out_channels, (h + 1) // 2, (w + 1) // 2)
+
 class DuelingDistributionalNoisyQNetwork(nn.Module):
     def __init__(self, env, n_envs=128, n_atoms=101, v_min=-100, v_max=100):
         super().__init__()
         self.env = env
         self.n_atoms = n_atoms
-        
         self.register_buffer("atoms", torch.linspace(v_min, v_max, steps=n_atoms))
         self.n = env.single_action_space.n
-        
-        self.network = nn.Sequential(
-            nn.Conv2d(4, 32, 8, stride=4),
-            nn.LayerNorm([32, 20, 20]),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, 4, stride=2),
-            nn.LayerNorm([64, 9, 9]),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, 3, stride=1),
-            nn.LayerNorm([64, 7, 7]),
-            nn.ReLU(),
+
+        c, h, w = envs.single_observation_space.shape
+        shape = (c, h, w)
+        conv_seqs = []
+        for out_channels in [16, 32, 32]:
+            conv_seq = ConvSequence(shape, out_channels, size=h)
+            shape = conv_seq.get_output_shape()
+            conv_seqs.append(conv_seq)
+            h = shape[1]
+
+        conv_seqs += [
             nn.Flatten(),
-        )
+            nn.ReLU(),
+        ]
+        self.network = nn.Sequential(*conv_seqs)
         
         self.advantage = nn.Sequential(
-            NoisyLinear(3136, 512),
+            NoisyLinear(in_features=shape[0] * shape[1] * shape[2], out_features=512),
             nn.LayerNorm(512),
             nn.ReLU(),
             NoisyLinear(512, self.n * n_atoms),
         )
-        
+
         self.value = nn.Sequential(
-            NoisyLinear(3136, 512),
+            NoisyLinear(in_features=shape[0] * shape[1] * shape[2], out_features=512),
             nn.LayerNorm(512),
             nn.ReLU(),
             NoisyLinear(512, n_atoms),
@@ -249,7 +297,7 @@ class DuelingDistributionalNoisyQNetwork(nn.Module):
         
     def forward(self, x, action=None):
         # dueling
-        x = self.network(x)
+        x = self.network(x / 255.0)
         advantage = self.advantage(x).view(-1, self.n, self.n_atoms)
         value = self.value(x).view(-1, 1, self.n_atoms)
         logits = value + advantage - advantage.mean(dim=1, keepdim=True)
@@ -260,7 +308,6 @@ class DuelingDistributionalNoisyQNetwork(nn.Module):
         
         if action is None:
             action = torch.argmax(q_values, 1)
-
         return action, pmfs[torch.arange(len(x)), action]
         
 if __name__ == "__main__":
@@ -302,6 +349,8 @@ if __name__ == "__main__":
         num_envs=args.num_envs,
         episodic_life=True,
         reward_clip=True,
+        img_width=84,
+        img_height=84,
         seed=args.seed,
     )
     envs.num_envs = args.num_envs
@@ -311,6 +360,7 @@ if __name__ == "__main__":
     assert isinstance(envs.action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
     q_network = DuelingDistributionalNoisyQNetwork(envs, n_atoms=args.n_atoms, v_min=args.v_min, v_max=args.v_max).to(device)
+    print(q_network)
     optimizer = optim.Adam(q_network.parameters(), lr=args.learning_rate, eps=0.01 / args.minibatch_size)
 
     # ALGO Logic: Storage setup
